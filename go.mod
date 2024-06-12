@@ -1,4 +1,4 @@
-module github.com/tkrajina/typescriptify-golang-structs
+module github.com/arpitbbhayani/transpiler
 
 go 1.16
 
