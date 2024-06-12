@@ -1,15 +1,17 @@
-package main
+package typescriptify
 
 import (
-	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"text/template"
+	"time"
 )
 
 type arrayImports []string
@@ -58,45 +60,71 @@ type Params struct {
 	Verbose       bool
 }
 
-func main() {
-	var p Params
-	var backupDir string
-	flag.StringVar(&p.ModelsPackage, "package", "", "Path of the package with models")
-	flag.StringVar(&p.TargetFile, "target", "", "Target typescript file")
-	flag.StringVar(&backupDir, "backup", "", "Directory where backup files are saved")
-	flag.BoolVar(&p.Interface, "interface", false, "Create interfaces (not classes)")
-	flag.Var(&p.CustomImports, "import", "Typescript import for your custom type, repeat this option for each import needed")
-	flag.BoolVar(&p.Verbose, "verbose", false, "Verbose logs")
-	flag.Parse()
+var structs []string
 
-	structs := []string{}
-	for _, structOrGoFile := range flag.Args() {
-		if strings.HasSuffix(structOrGoFile, ".go") {
-			fmt.Println("Parsing:", structOrGoFile)
-			fileStructs, err := GetGolangFileStructs(structOrGoFile)
-			if err != nil {
-				panic(fmt.Sprintf("Error loading/parsing golang file %s: %s", structOrGoFile, err.Error()))
-			}
-			structs = append(structs, fileStructs...)
-		} else {
-			structs = append(structs, structOrGoFile)
-		}
+func init() {
+	structs = []string{}
+}
+
+func visit(path string, fi fs.FileInfo, err error) error {
+	if err != nil {
+		fmt.Println(err)
+		return err
 	}
+	if !strings.HasSuffix(path, ".go") {
+		return nil
+	}
+	fileStructs, err := GetGolangFileStructs(path)
+	if err != nil {
+		panic(fmt.Sprintf("Error loading/parsing golang file %s: %s", path, err.Error()))
+	}
+	structs = append(structs, fileStructs...)
+	return nil
+}
+
+func popuplateStructs(dirpath string) {
+	err := filepath.Walk(dirpath, visit)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func TranspileDirectory(workingDir, packageDir, packagePath, outputFilepath string) {
+	var p Params
+
+	p.ModelsPackage = packagePath
+	p.TargetFile = outputFilepath
+	p.Interface = true
 
 	if len(p.ModelsPackage) == 0 {
 		fmt.Fprintln(os.Stderr, "No package given")
 		os.Exit(1)
 	}
-	if len(p.TargetFile) == 0 {
-		fmt.Fprintln(os.Stderr, "No target file")
-		os.Exit(1)
-	}
+
+	popuplateStructs(packageDir)
+	fmt.Printf("Found %d structs in %s.\n", len(structs), p.TargetFile)
 
 	t := template.Must(template.New("").Parse(TEMPLATE))
 
-	f, err := os.CreateTemp(os.TempDir(), "typescriptify_*.go")
-	handleErr(err)
-	defer f.Close()
+	temDirpath := filepath.Join(workingDir, fmt.Sprintf("transpiler_%d", time.Now().Unix()))
+	fmt.Println(temDirpath)
+	err := os.MkdirAll(temDirpath, 0766)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		os.RemoveAll(temDirpath)
+	}()
+
+	filepath := filepath.Join(temDirpath, "transpiler.go")
+	fp, err := os.Create(filepath)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		os.Remove(filepath)
+	}()
+	defer fp.Close()
 
 	structsArr := make([]string, 0)
 	for _, str := range structs {
@@ -108,18 +136,13 @@ func main() {
 
 	p.Structs = structsArr
 	p.InitParams = map[string]interface{}{
-		"BackupDir": fmt.Sprintf(`"%s"`, backupDir),
+		"BackupDir": fmt.Sprintf(`"%s"`, "."),
 	}
-	err = t.Execute(f, p)
+	err = t.Execute(fp, p)
 	handleErr(err)
 
-	if p.Verbose {
-		byts, err := os.ReadFile(f.Name())
-		handleErr(err)
-		fmt.Printf("\nCompiling generated code (%s):\n%s\n----------------------------------------------------------------------------------------------------\n", f.Name(), string(byts))
-	}
-
-	cmd := exec.Command("go", "run", f.Name())
+	cmd := exec.Command("go", "run", "transpiler.go")
+	cmd.Dir = temDirpath
 	fmt.Println(strings.Join(cmd.Args, " "))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
